@@ -70,8 +70,86 @@ class APKGenerator:
             print("Some features may not work correctly.")
             print("Install with: sudo apt-get install aapt zipalign openjdk-17-jdk")
 
+    def _find_android_jar(self) -> Optional[Path]:
+        """
+        Find android.jar for compilation.
+
+        Searches in common locations where the Android SDK platform JAR is installed.
+        Returns the path if found, None otherwise.
+        """
+        # Try specific known, tested paths first (in order of preference)
+        # We prefer stable API levels that are known to work with aapt
+        known_paths = [
+            # Debian/Ubuntu system packages - most reliable
+            Path('/usr/lib/android-sdk/platforms/android-23/android.jar'),
+            Path('/usr/lib/android-sdk/platforms/android-28/android.jar'),
+            Path('/usr/lib/android-sdk/platforms/android-30/android.jar'),
+            Path('/usr/share/java/com.android.android-23.jar'),
+            Path('/usr/share/java/com.android.android-28.jar'),
+            Path('/usr/share/java/com.android.android-30.jar'),
+        ]
+
+        for path in known_paths:
+            if path.exists():
+                return path
+
+        # Scan system SDK platforms directory for any available platform
+        sdk_platforms_dir = Path('/usr/lib/android-sdk/platforms')
+        if sdk_platforms_dir.exists():
+            # Sort numerically by API level (android-23 -> 23)
+            platforms = []
+            for platform in sdk_platforms_dir.iterdir():
+                jar_path = platform / 'android.jar'
+                if jar_path.exists():
+                    try:
+                        api_level = int(platform.name.replace('android-', '').split('.')[0])
+                        platforms.append((api_level, jar_path))
+                    except ValueError:
+                        pass
+            # Prefer API 23-30 range for stability
+            platforms.sort(key=lambda x: (0 if 23 <= x[0] <= 30 else 1, x[0]))
+            if platforms:
+                return platforms[0][1]
+
+        # Check ANDROID_HOME environment variable (user SDK installations)
+        android_home = os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT')
+        if android_home:
+            android_home_path = Path(android_home)
+            platforms_dir = android_home_path / 'platforms'
+            if platforms_dir.exists():
+                # Similar preference for stable API levels
+                platforms = []
+                for platform in platforms_dir.iterdir():
+                    jar_path = platform / 'android.jar'
+                    if jar_path.exists():
+                        try:
+                            api_level = int(platform.name.replace('android-', '').split('.')[0])
+                            platforms.append((api_level, jar_path))
+                        except ValueError:
+                            pass
+                platforms.sort(key=lambda x: (0 if 23 <= x[0] <= 30 else 1, x[0]))
+                if platforms:
+                    return platforms[0][1]
+
+        # Additional common installation paths
+        additional_paths = [
+            Path.home() / 'Android/Sdk/platforms/android-28/android.jar',
+            Path.home() / 'Android/Sdk/platforms/android-30/android.jar',
+            Path('/opt/android-sdk/platforms/android-28/android.jar'),
+            Path('/opt/android-sdk/platforms/android-30/android.jar'),
+        ]
+
+        for path in additional_paths:
+            if path.exists():
+                return path
+
+        return None
+
     def _create_android_manifest(self, work_dir: Path) -> str:
         """Create AndroidManifest.xml content."""
+        # Using target SDK 28 for broader compatibility while maintaining security
+        # Modern apps should target higher, but this ensures compatibility with
+        # the smali code we generate which uses basic Android APIs
         manifest = f'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="{self.package_name}"
@@ -80,7 +158,7 @@ class APKGenerator:
 
     <uses-sdk
         android:minSdkVersion="16"
-        android:targetSdkVersion="23" />
+        android:targetSdkVersion="28" />
 
     <uses-permission android:name="android.permission.INTERNET" />
 
@@ -139,25 +217,21 @@ public class MainActivity extends Activity {{
 
     def _compile_java_to_dex(self, work_dir: Path, java_file: Path) -> Optional[Path]:
         """Compile Java source to DEX bytecode."""
-        # Get android.jar path
-        android_jar = Path('/usr/lib/android-sdk/platforms/android-23/android.jar')
-        if not android_jar.exists():
-            # Try alternative path
-            android_jar = Path('/usr/share/java/com.android.android-23.jar')
+        android_jar = self._find_android_jar()
 
-        if not android_jar.exists():
-            print("Warning: android.jar not found, using pre-built DEX")
+        if not android_jar:
+            print("Warning: android.jar not found, using smali-based DEX generation")
             return None
 
         classes_dir = work_dir / 'classes'
         classes_dir.mkdir(exist_ok=True)
 
-        # Compile Java to class files
+        # Compile Java to class files using Java 11 bytecode (compatible with Android)
         try:
             result = subprocess.run([
                 'javac',
-                '-source', '1.8',
-                '-target', '1.8',
+                '-source', '11',
+                '-target', '11',
                 '-bootclasspath', str(android_jar),
                 '-classpath', str(android_jar),
                 '-d', str(classes_dir),
@@ -328,10 +402,20 @@ public class MainActivity extends Activity {{
         # For a truly functional APK without DEX compilation tools,
         # we'll need to use apktool to create the DEX from smali
 
-        # Check if apktool.jar exists
-        apktool_jar = Path('/home/runner/work/Evil-Droid/Evil-Droid/tools/apktool.jar')
+        # Find apktool.jar - first check relative to script, then in tools dir
+        script_dir = Path(__file__).parent.resolve()
+        possible_apktool_paths = [
+            script_dir / 'tools' / 'apktool.jar',
+            Path.cwd() / 'tools' / 'apktool.jar',
+        ]
 
-        if apktool_jar.exists():
+        apktool_jar = None
+        for path in possible_apktool_paths:
+            if path.exists():
+                apktool_jar = path
+                break
+
+        if apktool_jar and apktool_jar.exists():
             # Create a minimal APK structure that apktool can work with
             temp_apk_dir = work_dir / 'temp_apk'
             temp_apk_dir.mkdir(exist_ok=True)
@@ -340,7 +424,7 @@ public class MainActivity extends Activity {{
             smali_out = temp_apk_dir / 'smali' / self.package_name.replace('.', '/')
             smali_out.mkdir(parents=True, exist_ok=True)
 
-            # Write smali file
+            # Write smali file - with consistent messaging as the primary smali generator
             smali_code = f'''.class public L{package_path}/MainActivity;
 .super Landroid/app/Activity;
 
@@ -358,7 +442,7 @@ public class MainActivity extends Activity {{
     new-instance v0, Landroid/widget/TextView;
     invoke-direct {{v0, p0}}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V
 
-    const-string v1, "{self.app_name} - Evil-Droid"
+    const-string v1, "{self.app_name}\\n\\nWelcome to Evil-Droid Framework\\n\\nThis is a demonstration APK\\ngenerated for educational purposes."
     invoke-virtual {{v0, v1}}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V
 
     const/high16 v1, 0x41a00000
@@ -375,6 +459,8 @@ public class MainActivity extends Activity {{
             (smali_out / 'MainActivity.smali').write_text(smali_code)
 
             # Create apktool.yml
+            # forcedPackageId 127 (0x7f) is the standard Android resource package ID
+            # used for application resources. Framework resources use ID 1 (0x01).
             apktool_yml = f'''version: 2.2.4
 apkFileName: temp.apk
 isFrameworkApk: false
@@ -383,7 +469,7 @@ usesFramework:
   - 1
 sdkInfo:
   minSdkVersion: '16'
-  targetSdkVersion: '23'
+  targetSdkVersion: '28'
 packageInfo:
   renameManifestPackage: null
   forcedPackageId: '127'
@@ -501,12 +587,10 @@ sparseResources: false
         manifest_file = work_dir / 'AndroidManifest.xml'
         manifest_file.write_text(self._create_android_manifest(work_dir))
 
-        # Get android.jar path
-        android_jar = Path('/usr/lib/android-sdk/platforms/android-23/android.jar')
-        if not android_jar.exists():
-            android_jar = Path('/usr/share/java/com.android.android-23.jar')
+        # Get android.jar path using helper method
+        android_jar = self._find_android_jar()
 
-        if not android_jar.exists():
+        if not android_jar:
             print("Warning: android.jar not found for resource compilation")
             return None
 
@@ -522,7 +606,7 @@ sparseResources: false
                 '-I', str(android_jar),
                 '-F', str(resources_apk),
                 '--min-sdk-version', '16',
-                '--target-sdk-version', '23'
+                '--target-sdk-version', '28'
             ], capture_output=True, text=True, timeout=60)
 
             if resources_apk.exists():
@@ -639,8 +723,11 @@ sparseResources: false
                             if name not in zf.namelist():
                                 zf.writestr(name, res_zf.read(name))
                 else:
-                    # Manually create AndroidManifest.xml in binary format
-                    # For simplicity, include as plain text (won't work on real devices)
+                    # If aapt failed, the APK won't be installable on real devices
+                    # because Android requires binary AndroidManifest.xml
+                    print("Warning: Resource compilation failed - APK may not install on devices")
+                    print("    Install android-sdk-platform-23 or higher for full compatibility")
+                    # Still include the manifest for structural completeness
                     manifest = self._create_android_manifest(work_dir)
                     zf.writestr('AndroidManifest.xml', manifest)
 
