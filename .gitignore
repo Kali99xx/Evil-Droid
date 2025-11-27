@@ -1,0 +1,31 @@
+# Generated APK files
+evilapk/*.apk
+
+# Temporary build files
+*.class
+*.dex
+payload/
+original/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backup files
+*~
+*.bak
+*.swp
